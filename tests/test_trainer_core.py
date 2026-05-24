@@ -19,7 +19,7 @@ class TrainerCoreTests(unittest.TestCase):
             repeats=10,
             dataset_repeat=5,
             epochs=10,
-            train_batch_size=1,
+            train_batch_size=4,
             gradient_accumulation_steps=1,
         )
 
@@ -90,6 +90,10 @@ class TrainerCoreTests(unittest.TestCase):
             )
 
         self.assertIn("--lora_checkpoint", args)
+        self.assertEqual(args[args.index("--lora_rank") + 1], "20")
+        self.assertEqual(args[args.index("--gradient_accumulation_steps") + 1], "1")
+        self.assertNotIn("--network_alpha", args)
+        self.assertNotIn("--train_batch_size", args)
 
     def test_progress_tracker_accumulates_reset_epochs(self):
         tracker = ProgressTracker(expected_total=30)

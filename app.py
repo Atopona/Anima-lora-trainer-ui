@@ -17,7 +17,9 @@ import threading
 import time
 import atexit
 import importlib.metadata as importlib_metadata
+import traceback
 import urllib.request
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +54,8 @@ CONFIGS_DIR = ROOT / "configs"
 LOGS_DIR = ROOT / "logs"
 TB_LOGS_ROOT = LOGS_DIR / "tb"
 SAMPLES_DIR = LOGS_DIR / "samples"
+SAMPLE_LOG_TAIL_LINES = 80
+SAMPLE_POLL_SECONDS = 2.0
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
 DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
@@ -1052,6 +1056,7 @@ _training_lock = threading.Lock()
 _current_training: dict = {"process": None, "manifest_path": "", "log_file": "", "stop_requested": False}
 _sample_lock = threading.Lock()
 _sample_jobs: list[dict] = []
+_pending_sample_jobs: list[dict] = []
 
 MODEL_TABLE_HEADERS = ["model", "status", "size_gb", "path", "url"]
 HISTORY_TABLE_HEADERS = ["created_at", "project", "backend", "status", "latest_output", "log_file", "manifest"]
@@ -1069,6 +1074,11 @@ def _set_current_training(process=None, manifest_path: str = "", log_file: str =
 def _get_current_training() -> dict:
     with _training_lock:
         return dict(_current_training)
+
+
+def _is_training_active() -> bool:
+    process = _get_current_training().get("process")
+    return process is not None and process.poll() is None
 
 
 def stop_training() -> str:
@@ -1240,15 +1250,58 @@ def refresh_sample_gallery() -> list[str]:
     ]
 
 
+def _read_tail(path: Path, max_lines: int = SAMPLE_LOG_TAIL_LINES) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    lines: deque[str] = deque(maxlen=max_lines)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                lines.append(line.rstrip("\n"))
+    except Exception as exc:
+        return f"Could not read log tail: {exc}"
+    return "\n".join(lines).strip()
+
+
+def _format_sample_job(job: dict) -> str:
+    status = str(job.get("status", ""))
+    if status == "running":
+        display_status = t("sample_status_running")
+    elif status == "deferred":
+        display_status = t("sample_status_deferred")
+    elif status == "done":
+        display_status = t("sample_status_done")
+    elif status.startswith("failed"):
+        display_status = t("sample_status_failed")
+        if job.get("returncode") is not None:
+            display_status += f":{job['returncode']}"
+    else:
+        display_status = status
+
+    lines = [f"**{job.get('created_at', '')} | {display_status}**"]
+    if job.get("output"):
+        lines.append(f"{t('sample_status_output')}: `{job['output']}`")
+    if job.get("log_path"):
+        lines.append(f"{t('sample_status_log')}: `{job['log_path']}`")
+    if job.get("error") and str(job.get("error")) != str(job.get("log_path", "")):
+        lines.append(str(job["error"]))
+
+    if status.startswith("failed"):
+        tail = job.get("log_tail") or _read_tail(Path(job.get("log_path", "")))
+        if not tail and job.get("traceback"):
+            tail = str(job["traceback"])
+        if tail:
+            safe_tail = str(tail).replace("```", "` ` `")
+            lines.append(f"{t('sample_status_error_tail')}:\n```text\n{safe_tail}\n```")
+    return "\n".join(lines)
+
+
 def _sample_job_status() -> str:
     with _sample_lock:
         rows = list(_sample_jobs[-20:])
     if not rows:
         return t("sample_status_idle")
-    return "\n".join(
-        f"{row.get('created_at', '')} | {row.get('status', '')} | {row.get('output', '') or row.get('error', '')}"
-        for row in rows
-    )
+    return "\n\n".join(_format_sample_job(row) for row in rows)
 
 
 def _find_latest_lora(output_dir: str) -> str:
@@ -1256,10 +1309,83 @@ def _find_latest_lora(output_dir: str) -> str:
     return files[0]["path"] if files else ""
 
 
-def _run_sample_job(job: dict) -> None:
+def _build_sample_job(
+    lora_path: str,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    cfg_scale: float,
+    seed: int,
+    low_vram: bool,
+    base_model: str,
+) -> tuple[dict | None, str]:
+    lora_path = (lora_path or "").strip() or _find_latest_lora(load_config().get("output_directory", ""))
+    if not lora_path:
+        return None, t("sample_no_lora")
+
+    dit_model = get_dit_model_path(base_model)
+    required_paths = {
+        "LoRA": Path(lora_path),
+        "DiT": dit_model,
+        "Qwen3": QWEN3_MODEL,
+        "VAE": VAE_MODEL,
+    }
+    missing = [f"{name}: {path}" for name, path in required_paths.items() if not path.exists()]
+    if missing:
+        return None, t("sample_missing_files", files="\n".join(missing))
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output = SAMPLES_DIR / Path(lora_path).stem / f"sample_{timestamp}.png"
+    log_path = output.with_suffix(".log")
+    job = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "running",
+        "lora": lora_path,
+        "dit": str(dit_model),
+        "qwen3": str(QWEN3_MODEL),
+        "vae": str(VAE_MODEL),
+        "output": str(output),
+        "log_path": str(log_path),
+        "prompt": prompt or "",
+        "negative_prompt": negative_prompt or "",
+        "width": int(width),
+        "height": int(height),
+        "steps": int(steps),
+        "cfg_scale": float(cfg_scale),
+        "seed": int(seed),
+        "low_vram": bool(low_vram),
+    }
+    return job, t("sample_started", path=str(output))
+
+
+def _register_sample_job(job: dict) -> None:
     with _sample_lock:
-        _sample_jobs.append(job)
-    log_path = Path(job["output"]).with_suffix(".log")
+        if job not in _sample_jobs:
+            _sample_jobs.append(job)
+
+
+def _queue_sample_job(job: dict) -> None:
+    with _sample_lock:
+        job["status"] = "deferred"
+        if job not in _sample_jobs:
+            _sample_jobs.append(job)
+        if job not in _pending_sample_jobs:
+            _pending_sample_jobs.append(job)
+
+
+def _pop_pending_sample_jobs() -> list[dict]:
+    with _sample_lock:
+        jobs = list(_pending_sample_jobs)
+        _pending_sample_jobs.clear()
+    return jobs
+
+
+def _run_sample_job(job: dict) -> None:
+    _register_sample_job(job)
+    job["status"] = "running"
+    log_path = Path(job.get("log_path") or Path(job["output"]).with_suffix(".log"))
     cmd = [
         sys.executable,
         str(ANIMA_SAMPLE_SCRIPT),
@@ -1279,7 +1405,9 @@ def _run_sample_job(job: dict) -> None:
     if job.get("low_vram"):
         cmd.append("--low_vram")
     try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "w", encoding="utf-8", errors="ignore") as log_f:
+            log_f.write("Command: " + shlex.join(cmd) + "\n\n")
             proc = subprocess.run(
                 cmd,
                 stdout=log_f,
@@ -1287,12 +1415,27 @@ def _run_sample_job(job: dict) -> None:
                 cwd=str(ROOT),
                 text=True,
             )
-        job["status"] = "done" if proc.returncode == 0 else f"failed:{proc.returncode}"
-        if proc.returncode != 0:
+        job["returncode"] = proc.returncode
+        if proc.returncode == 0 and Path(job["output"]).exists():
+            job["status"] = "done"
+        elif proc.returncode == 0:
+            job["status"] = "failed:missing-output"
+            job["error"] = "Sample command exited successfully, but the image file was not created."
+        else:
+            job["status"] = f"failed:{proc.returncode}"
             job["error"] = str(log_path)
+        job["log_tail"] = _read_tail(log_path)
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = str(exc)
+        job["traceback"] = traceback.format_exc()
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8", errors="ignore") as log_f:
+                log_f.write("\n" + job["traceback"])
+            job["log_tail"] = _read_tail(log_path)
+        except Exception:
+            pass
 
 
 def launch_sample(
@@ -1307,30 +1450,63 @@ def launch_sample(
     low_vram: bool,
     base_model: str,
 ):
-    lora_path = (lora_path or "").strip() or _find_latest_lora(load_config().get("output_directory", ""))
-    if not lora_path:
-        return t("sample_no_lora"), refresh_sample_gallery()
-    dit_model = get_dit_model_path(base_model)
-    output = SAMPLES_DIR / Path(lora_path).stem / f"sample_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    job = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "running",
-        "lora": lora_path,
-        "dit": str(dit_model),
-        "qwen3": str(QWEN3_MODEL),
-        "vae": str(VAE_MODEL),
-        "output": str(output),
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "width": int(width),
-        "height": int(height),
-        "steps": int(steps),
-        "cfg_scale": float(cfg_scale),
-        "seed": int(seed),
-        "low_vram": bool(low_vram),
-    }
+    job, message = _build_sample_job(
+        lora_path, prompt, negative_prompt, width, height, steps, cfg_scale, seed, low_vram, base_model
+    )
+    if job is None:
+        return message, refresh_sample_gallery()
+    if _is_training_active():
+        return t("sample_training_active"), refresh_sample_gallery()
     threading.Thread(target=_run_sample_job, args=(job,), daemon=True).start()
-    return t("sample_started", path=str(output)), refresh_sample_gallery()
+    return _format_sample_job(job), refresh_sample_gallery()
+
+
+def launch_sample_and_wait(
+    lora_path: str,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    cfg_scale: float,
+    seed: int,
+    low_vram: bool,
+    base_model: str,
+    diffsynth_dir: str = "",
+):
+    job, message = _build_sample_job(
+        lora_path, prompt, negative_prompt, width, height, steps, cfg_scale, seed, low_vram, base_model
+    )
+    if job is None:
+        yield message, refresh_sample_gallery()
+        return
+    if _is_training_active():
+        yield t("sample_training_active"), refresh_sample_gallery()
+        return
+
+    sample_runtime_log: list[str] = []
+    cfg = load_config()
+    ds_dir = resolve_diffsynth_dir(diffsynth_dir or cfg.get("diffsynth_dir", ""))
+    yield t("sample_runtime_check", path=str(ds_dir)), refresh_sample_gallery()
+    for item in ensure_diffsynth_installed(ds_dir):
+        if isinstance(item, tuple) and item and item[0] == "__done__":
+            ok = bool(item[1])
+            message = str(item[2])
+            if not ok:
+                sample_runtime_log.append(message)
+                yield t("sample_runtime_failed", err="\n".join(sample_runtime_log[-20:])), refresh_sample_gallery()
+                return
+            break
+        sample_runtime_log.append(str(item))
+        yield "\n".join(sample_runtime_log[-20:]), refresh_sample_gallery()
+
+    thread = threading.Thread(target=_run_sample_job, args=(job,), daemon=True)
+    thread.start()
+    yield _format_sample_job(job), refresh_sample_gallery()
+    while thread.is_alive():
+        time.sleep(SAMPLE_POLL_SECONDS)
+        yield _format_sample_job(job), refresh_sample_gallery()
+    yield _format_sample_job(job), refresh_sample_gallery()
 
 
 def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_loras: set[str]) -> str | None:
@@ -1343,7 +1519,8 @@ def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_
     if not lora_path or lora_path in seen_loras:
         return None
     seen_loras.add(lora_path)
-    status, _ = launch_sample(
+
+    job, message = _build_sample_job(
         lora_path=lora_path,
         prompt=cfg.get("sample_prompt", ""),
         negative_prompt=cfg.get("sample_negative_prompt", ""),
@@ -1355,7 +1532,25 @@ def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_
         low_vram=bool(cfg.get("sample_low_vram", False)),
         base_model=base_model,
     )
-    return status
+    if job is None:
+        return message
+    if _is_training_active():
+        _queue_sample_job(job)
+        return t("sample_deferred_until_training_done", path=job["output"])
+    threading.Thread(target=_run_sample_job, args=(job,), daemon=True).start()
+    return _format_sample_job(job)
+
+
+def run_pending_sample_jobs() -> list[str]:
+    messages: list[str] = []
+    for job in _pop_pending_sample_jobs():
+        messages.append(t("sample_pending_start", path=job["output"]))
+        _run_sample_job(job)
+        if job.get("status") == "done":
+            messages.append(t("sample_pending_done", path=job["output"]))
+        else:
+            messages.append(t("sample_pending_failed", path=job.get("log_path", "")))
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +1888,13 @@ def start_training(
     if loss_writer:
         loss_writer.close()
 
+    pending_sample_messages = run_pending_sample_jobs()
+    if pending_sample_messages:
+        for message in pending_sample_messages:
+            text = emit(message, force=True)
+            if text is not None:
+                yield text
+
     status = "success" if exit_code == 0 else "cancelled" if stop_requested or exit_code < 0 else "failed"
     update_run_manifest(
         manifest_path,
@@ -1952,16 +2154,16 @@ def build_ui() -> gr.Blocks:
                     gr.Markdown(f"### {t('section_network')}")
                     with gr.Row():
                         network_dim = gr.Number(label=t("network_dim"), value=cfg["network_dim"], precision=0, minimum=1)
-                        network_alpha = gr.Number(label=t("network_alpha"), value=cfg["network_alpha"], precision=0, minimum=1)
+                        network_alpha = gr.Number(label=t("network_alpha"), value=cfg["network_alpha"], precision=0, minimum=1, visible=not is_diffsynth)
                         learning_rate = gr.Number(label=t("learning_rate"), value=cfg["learning_rate"])
                         max_train_epochs = gr.Number(label=t("max_epochs"), value=cfg["max_train_epochs"], precision=0, minimum=1)
 
                 with gr.Group():
                     gr.Markdown(f"### {t('section_dataset')}")
                     with gr.Row():
-                        resolution = gr.Number(label=t("resolution"), value=cfg["resolution"], precision=0, minimum=64)
-                        repeats = gr.Number(label=t("repeats"), value=cfg["repeats"], precision=0, minimum=1)
-                        caption_dropout = gr.Slider(label=t("caption_dropout"), minimum=0.0, maximum=1.0, step=0.05, value=cfg["caption_dropout"])
+                        resolution = gr.Number(label=t("resolution"), value=cfg["resolution"], precision=0, minimum=64, visible=not is_diffsynth)
+                        repeats = gr.Number(label=t("repeats"), value=cfg["repeats"], precision=0, minimum=1, visible=not is_diffsynth)
+                        caption_dropout = gr.Slider(label=t("caption_dropout"), minimum=0.0, maximum=1.0, step=0.05, value=cfg["caption_dropout"], visible=not is_diffsynth)
 
                 gr.Markdown("---")
                 gr.Markdown(f"### {t('section_config_training')}")
@@ -2035,9 +2237,9 @@ def build_ui() -> gr.Blocks:
                 with gr.Group():
                     gr.Markdown(f"### {t('section_batch')}")
                     with gr.Row():
-                        train_batch_size = gr.Number(label=t("train_batch_size"), value=cfg["train_batch_size"], precision=0, minimum=1)
+                        train_batch_size = gr.Number(label=t("train_batch_size"), value=cfg["train_batch_size"], precision=0, minimum=1, visible=not is_diffsynth)
                         gradient_accumulation_steps = gr.Number(label=t("grad_accum_steps"), value=cfg["gradient_accumulation_steps"], precision=0, minimum=1)
-                        max_grad_norm = gr.Number(label=t("max_grad_norm"), value=cfg["max_grad_norm"])
+                        max_grad_norm = gr.Number(label=t("max_grad_norm"), value=cfg["max_grad_norm"], visible=not is_diffsynth)
 
                 with gr.Group():
                     gr.Markdown(f"### {t('section_resume')}")
@@ -2202,9 +2404,15 @@ def build_ui() -> gr.Blocks:
             ds = backend_value == "diffsynth"
             return (
                 gr.update(visible=ds),         # diffsynth_group
+                gr.update(visible=not ds),     # network_alpha
+                gr.update(visible=not ds),     # resolution
+                gr.update(visible=not ds),     # repeats
+                gr.update(visible=not ds),     # caption_dropout
                 gr.update(visible=not ds),     # kohya_optimizer_group
                 gr.update(visible=not ds),     # kohya_saving_group
                 gr.update(visible=not ds),     # kohya_noise_group
+                gr.update(visible=not ds),     # train_batch_size
+                gr.update(visible=not ds),     # max_grad_norm
                 gr.update(visible=not ds),     # vae_chunk_size
                 gr.update(visible=not ds),     # cache_latents
                 gr.update(visible=not ds),     # cache_text_encoder
@@ -2215,8 +2423,9 @@ def build_ui() -> gr.Blocks:
             fn=_toggle_backend,
             inputs=[backend_radio],
             outputs=[
-                diffsynth_group, kohya_optimizer_group, kohya_saving_group,
-                kohya_noise_group, vae_chunk_size, cache_latents,
+                diffsynth_group, network_alpha, resolution, repeats, caption_dropout,
+                kohya_optimizer_group, kohya_saving_group, kohya_noise_group,
+                train_batch_size, max_grad_norm, vae_chunk_size, cache_latents,
                 cache_text_encoder_outputs, vae_disable_cache,
             ],
         )
@@ -2277,11 +2486,11 @@ def build_ui() -> gr.Blocks:
         refresh_sample_status_btn.click(fn=_sample_job_status, inputs=[], outputs=[sample_status_md])
         use_latest_lora_btn.click(fn=latest_output_path, inputs=[outputs_dir_input], outputs=[sample_lora_path])
         run_sample_btn.click(
-            fn=launch_sample,
+            fn=launch_sample_and_wait,
             inputs=[
                 sample_lora_path, sample_prompt, sample_negative_prompt,
                 sample_width, sample_height, sample_steps, sample_cfg_scale,
-                sample_seed, sample_low_vram, base_model_dropdown,
+                sample_seed, sample_low_vram, base_model_dropdown, diffsynth_dir_in,
             ],
             outputs=[sample_status_md, sample_gallery],
         )
