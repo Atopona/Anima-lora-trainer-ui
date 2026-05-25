@@ -27,6 +27,8 @@ APPLIED_PARAMETERS: tuple[DiffSynthParameter, ...] = (
     DiffSynthParameter("Max pixels", "--max_pixels", "Dynamic resolution pixel budget."),
     DiffSynthParameter("Dataset repeat", "--dataset_repeat", "DiffSynth repeat count per epoch."),
     DiffSynthParameter("Model paths", "--model_paths", "DiT, Qwen3 text encoder, and VAE safetensors."),
+    DiffSynthParameter("Tokenizer path", "--tokenizer_path", "Local Qwen tokenizer directory; avoids DiffSynth downloading Qwen/Qwen3-0.6B at train time."),
+    DiffSynthParameter("T5 tokenizer path", "--tokenizer_t5xxl_path", "Local SD3.5 tokenizer_3 directory; avoids DiffSynth downloading tokenizer files at train time."),
     DiffSynthParameter("Learning rate", "--learning_rate", "Optimizer learning rate used by DiffSynth."),
     DiffSynthParameter("Epochs", "--num_epochs", "Number of full dataset passes."),
     DiffSynthParameter("Output path", "--output_path", "Where LoRA checkpoints are saved."),
@@ -98,6 +100,19 @@ def migrate_args_for_anima(args: list[str]) -> list[str]:
         return args
     if metadata_idx < len(args):
         args[metadata_idx] = str(migrate_diffsynth_metadata_for_anima(Path(args[metadata_idx])))
+    return args
+
+
+def set_anima_tokenizer_args(
+    args: list[str],
+    tokenizer_path: str = "",
+    tokenizer_t5xxl_path: str = "",
+) -> list[str]:
+    args = list(args)
+    if tokenizer_path:
+        _set_or_append_arg(args, "--tokenizer_path", str(tokenizer_path))
+    if tokenizer_t5xxl_path:
+        _set_or_append_arg(args, "--tokenizer_t5xxl_path", str(tokenizer_t5xxl_path))
     return args
 
 
@@ -173,6 +188,8 @@ def create_training_args(
     gradient_accumulation_steps: int,
     save_steps: int,
     resume_lora_path: str = "",
+    tokenizer_path: str = "",
+    tokenizer_t5xxl_path: str = "",
 ) -> tuple[list[str], str]:
     model_paths_json = json.dumps([str(dit_model_path), str(qwen3_model_path), str(vae_model_path)])
     lora_target_modules = normalize_lora_target_modules(lora_target_modules)
@@ -193,6 +210,7 @@ def create_training_args(
         "--lora_rank", str(int(lora_rank)),
         "--gradient_accumulation_steps", str(int(gradient_accumulation_steps)),
     ]
+    args = set_anima_tokenizer_args(args, tokenizer_path, tokenizer_t5xxl_path)
     if use_gradient_checkpointing:
         args.append("--use_gradient_checkpointing")
     if save_steps and int(save_steps) > 0:

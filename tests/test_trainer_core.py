@@ -96,13 +96,27 @@ class TrainerCoreTests(unittest.TestCase):
                 gradient_accumulation_steps=1,
                 save_steps=0,
                 resume_lora_path=str(root / "resume.safetensors"),
+                tokenizer_path=str(root / "Qwen3-0.6B"),
+                tokenizer_t5xxl_path=str(root / "tokenizer_3"),
             )
 
         self.assertIn("--lora_checkpoint", args)
+        self.assertEqual(args[args.index("--tokenizer_path") + 1], str(root / "Qwen3-0.6B"))
+        self.assertEqual(args[args.index("--tokenizer_t5xxl_path") + 1], str(root / "tokenizer_3"))
         self.assertEqual(args[args.index("--lora_rank") + 1], "20")
         self.assertEqual(args[args.index("--gradient_accumulation_steps") + 1], "1")
         self.assertNotIn("--network_alpha", args)
         self.assertNotIn("--train_batch_size", args)
+
+    def test_diffsynth_args_migration_adds_tokenizer_paths(self):
+        args = diffsynth.set_anima_tokenizer_args(
+            ["--model_paths", "[]"],
+            tokenizer_path="/models/Qwen/Qwen3-0.6B",
+            tokenizer_t5xxl_path="/models/sd35/tokenizer_3",
+        )
+
+        self.assertEqual(args[args.index("--tokenizer_path") + 1], "/models/Qwen/Qwen3-0.6B")
+        self.assertEqual(args[args.index("--tokenizer_t5xxl_path") + 1], "/models/sd35/tokenizer_3")
 
     def test_progress_tracker_accumulates_reset_epochs(self):
         tracker = ProgressTracker(expected_total=30, expected_epoch_total=20)

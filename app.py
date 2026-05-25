@@ -457,10 +457,12 @@ def create_diffsynth_training_args(
     gradient_accumulation_steps: int,
     save_steps: int,
     resume_lora_path: str = "",
+    diffsynth_dir: str | Path = "",
 ) -> tuple[list[str], str]:
     """Build the DiffSynth CLI args list and persist them next to other configs."""
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     args_path = CONFIGS_DIR / f"{project_name}_diffsynth_args_{current_date}.json"
+    ds_dir = resolve_diffsynth_dir(str(diffsynth_dir or load_config().get("diffsynth_dir", "")))
     return diffsynth_core.create_training_args(
         args_path=args_path,
         output_dir=output_dir,
@@ -479,6 +481,8 @@ def create_diffsynth_training_args(
         gradient_accumulation_steps=gradient_accumulation_steps,
         save_steps=save_steps,
         resume_lora_path=resume_lora_path,
+        tokenizer_path=str(diffsynth_support_path("DiffSynth:Qwen tokenizer", ds_dir)),
+        tokenizer_t5xxl_path=str(diffsynth_support_path("DiffSynth:SD3.5 tokenizer_3", ds_dir)),
     )
 
 
@@ -901,6 +905,7 @@ def configure_training(
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 save_steps=save_steps_ds,
                 resume_lora_path=resume_lora_path,
+                diffsynth_dir=ds_dir,
             )
             lines.append(t("info_args_written", path=diffsynth_args_path))
         except Exception as e:
@@ -1906,10 +1911,17 @@ def start_training(
             yield emit_force(t("err_no_train_cfg"))
             return
 
+        ds_dir = resolve_diffsynth_dir(diffsynth_dir or saved_cfg.get("diffsynth_dir", ""))
+
         try:
             with open(diffsynth_args_path, "r", encoding="utf-8") as f:
                 ds_args = json.load(f)
             ds_args = migrate_diffsynth_args_for_anima(ds_args)
+            ds_args = diffsynth_core.set_anima_tokenizer_args(
+                ds_args,
+                tokenizer_path=str(diffsynth_support_path("DiffSynth:Qwen tokenizer", ds_dir)),
+                tokenizer_t5xxl_path=str(diffsynth_support_path("DiffSynth:SD3.5 tokenizer_3", ds_dir)),
+            )
         except Exception as e:
             yield emit_force(t("err_generate_failed", err=e))
             return
