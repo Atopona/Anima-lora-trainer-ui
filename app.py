@@ -56,8 +56,12 @@ CONFIGS_DIR = ROOT / "configs"
 LOGS_DIR = ROOT / "logs"
 TB_LOGS_ROOT = LOGS_DIR / "tb"
 SAMPLES_DIR = LOGS_DIR / "samples"
+TRAINING_STATE_FILE = LOGS_DIR / "current_training.json"
+SAMPLE_QUEUE_FILE = LOGS_DIR / "sample_queue.json"
 SAMPLE_LOG_TAIL_LINES = 80
 SAMPLE_POLL_SECONDS = 2.0
+SAMPLE_LORA_STABLE_SECONDS = 3.0
+TRAINING_POLL_SECONDS = 1.0
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
 DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
@@ -224,6 +228,7 @@ DEFAULTS = {
     "last_diffsynth_args": "",
     "last_tb_logdir": "",
     "last_run_manifest": "",
+    "last_config_status": "",
 }
 
 
@@ -285,6 +290,14 @@ def gpu_index_from_choice(choice: str) -> str:
     if not choice:
         return "0"
     return str(choice).split(":")[0].strip()
+
+
+def gpu_choice_from_index(index: str | int | None) -> str:
+    saved = str(index if index is not None else "0")
+    return next(
+        (choice for choice in GPU_CHOICES if str(choice).startswith(saved + ":")),
+        GPU_CHOICES[0] if GPU_CHOICES else saved,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -967,12 +980,14 @@ def configure_training(
         "last_diffsynth_args": diffsynth_args_path,
         "last_tb_logdir": tb_logdir,
         "last_run_manifest": "",
+        "last_config_status": "",
     }
-    save_config(cfg)
 
     lines.append("")
     lines.append(t("info_ready"))
-    return "\n".join(lines), train_cfg, dataset_cfg, diffsynth_args_path, tb_logdir
+    cfg["last_config_status"] = "\n".join(lines)
+    save_config(cfg)
+    return cfg["last_config_status"], train_cfg, dataset_cfg, diffsynth_args_path, tb_logdir
 
 
 # ---------------------------------------------------------------------------
@@ -1083,12 +1098,72 @@ class TailLogBuffer:
         return "\n".join(self.lines)
 
 
+def _write_json_atomic(path: Path, payload: dict | list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    tmp.replace(path)
+
+
+def _read_json_file(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _pid_is_running(pid: int | str | None) -> bool:
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 _training_lock = threading.Lock()
-_current_training: dict = {"process": None, "manifest_path": "", "log_file": "", "stop_requested": False}
+_current_training: dict = {
+    "process": None,
+    "thread": None,
+    "manifest_path": "",
+    "log_file": "",
+    "stop_requested": False,
+    "last_log_tail": "",
+    "status": "idle",
+    "started_at": "",
+    "finished_at": "",
+    "backend": "",
+    "project_name": "",
+}
 _sample_lock = threading.Lock()
 _sample_jobs: list[dict] = []
 _pending_sample_jobs: list[dict] = []
 _sample_job_counter = 0
+_UNSET = object()
 
 MODEL_TABLE_HEADERS = ["model", "status", "size_gb", "path", "url"]
 DIFFSYNTH_PARAMETER_TABLE_HEADERS = ["parameter", "diffsynth_arg", "value", "status", "note"]
@@ -1097,12 +1172,72 @@ OUTPUT_TABLE_HEADERS = ["name", "size_mb", "modified", "path"]
 SAMPLE_QUEUE_HEADERS = ["id", "created_at", "status", "elapsed", "output", "log_path", "lora", "seed", "size", "steps", "cfg_scale", "prompt"]
 
 
-def _set_current_training(process=None, manifest_path: str = "", log_file: str = "") -> None:
+def _training_state_for_disk(state: dict) -> dict:
+    payload = {
+        key: value
+        for key, value in state.items()
+        if key not in {"process", "thread"} and not str(key).startswith("_")
+    }
+    process = state.get("process")
+    if process is not None:
+        payload["pid"] = getattr(process, "pid", None)
+    return payload
+
+
+def _persist_current_training_unlocked() -> None:
+    _write_json_atomic(TRAINING_STATE_FILE, _training_state_for_disk(_current_training))
+
+
+def _set_current_training(
+    process=_UNSET,
+    manifest_path: str | None = None,
+    log_file: str | None = None,
+    *,
+    status: str | None = None,
+    thread=_UNSET,
+    stop_requested: bool | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    backend: str | None = None,
+    project_name: str | None = None,
+    last_log_tail: str | None = None,
+    error: str | None = None,
+    clear_error: bool = False,
+) -> None:
     with _training_lock:
-        _current_training["process"] = process
-        _current_training["manifest_path"] = manifest_path
-        _current_training["log_file"] = log_file
-        _current_training["stop_requested"] = False
+        if process is not _UNSET:
+            _current_training["process"] = process
+        if thread is not _UNSET:
+            _current_training["thread"] = thread
+        if manifest_path is not None:
+            _current_training["manifest_path"] = manifest_path
+        if log_file is not None:
+            _current_training["log_file"] = log_file
+        if status is not None:
+            _current_training["status"] = status
+        if stop_requested is not None:
+            _current_training["stop_requested"] = bool(stop_requested)
+        if started_at is not None:
+            _current_training["started_at"] = started_at
+        if finished_at is not None:
+            _current_training["finished_at"] = finished_at
+        if backend is not None:
+            _current_training["backend"] = backend
+        if project_name is not None:
+            _current_training["project_name"] = project_name
+        if last_log_tail is not None:
+            _current_training["last_log_tail"] = last_log_tail
+        if clear_error:
+            _current_training.pop("error", None)
+        if error is not None:
+            _current_training["error"] = error
+        _persist_current_training_unlocked()
+
+
+def _update_current_training_tail(text: str) -> None:
+    with _training_lock:
+        _current_training["last_log_tail"] = text or ""
+        _persist_current_training_unlocked()
 
 
 def _get_current_training() -> dict:
@@ -1115,37 +1250,156 @@ def _is_training_active() -> bool:
     return process is not None and process.poll() is None
 
 
+def _is_training_busy() -> bool:
+    state = _get_current_training()
+    process = state.get("process")
+    if process is not None and process.poll() is None:
+        return True
+    thread = state.get("thread")
+    return thread is not None and thread.is_alive()
+
+
+def _load_persisted_training_state() -> dict:
+    state = _read_json_file(TRAINING_STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _last_manifest_payload(cfg: dict | None = None) -> dict:
+    cfg = cfg or load_config()
+    manifest = cfg.get("last_run_manifest", "")
+    if manifest:
+        payload = _read_json_file(Path(manifest), {})
+        if payload:
+            payload["_manifest_path"] = manifest
+            return payload
+    roots = [LOGS_DIR]
+    if cfg.get("output_directory"):
+        roots.append(cfg["output_directory"])
+    rows = scan_run_manifests(*roots)
+    if rows:
+        payload = _read_json_file(Path(rows[0]["manifest"]), {})
+        if payload:
+            payload["_manifest_path"] = rows[0]["manifest"]
+            return payload
+    return {}
+
+
+def _training_log_path_from_state_or_manifest(cfg: dict | None = None) -> str:
+    state = _get_current_training()
+    if state.get("log_file"):
+        return str(state["log_file"])
+    persisted = _load_persisted_training_state()
+    if persisted.get("log_file"):
+        return str(persisted["log_file"])
+    manifest = _last_manifest_payload(cfg)
+    if manifest.get("log_file"):
+        return str(manifest["log_file"])
+    return ""
+
+
+def restored_training_log() -> str:
+    cfg = load_config()
+    state = _get_current_training()
+    if state.get("last_log_tail"):
+        return str(state["last_log_tail"])
+    persisted = _load_persisted_training_state()
+    if persisted.get("last_log_tail") and persisted.get("status") in {"starting", "running"}:
+        return str(persisted["last_log_tail"])
+    log_path = _training_log_path_from_state_or_manifest(cfg)
+    if log_path:
+        return _read_tail(Path(log_path), max_lines=int(cfg.get("log_tail_lines", 500)))
+    return ""
+
+
+def restored_config_status() -> str:
+    cfg = load_config()
+    lines: list[str] = []
+    state = _get_current_training()
+    persisted = _load_persisted_training_state()
+    active = _is_training_active()
+    if active:
+        lines.append(t("training_status_active", pid=getattr(state.get("process"), "pid", "")))
+    elif _is_training_busy():
+        lines.append(t("training_status_thread_active", status=state.get("status", "running")))
+    elif state.get("status") in {"success", "failed", "cancelled", "preflight_failed"}:
+        lines.append(t("training_status_last", status=state.get("status", "")))
+    elif persisted.get("status") in {"starting", "running"} and _pid_is_running(persisted.get("pid")):
+        lines.append(t("training_status_detached", pid=persisted.get("pid")))
+    elif persisted.get("status") in {"success", "failed", "cancelled", "preflight_failed"}:
+        lines.append(t("training_status_last", status=persisted.get("status", "")))
+
+    manifest_path = state.get("manifest_path") or persisted.get("manifest_path") or cfg.get("last_run_manifest", "")
+    log_file = state.get("log_file") or persisted.get("log_file") or _training_log_path_from_state_or_manifest(cfg)
+    if manifest_path:
+        lines.append(t("training_status_manifest", path=manifest_path))
+    if log_file:
+        lines.append(t("training_status_log", path=log_file))
+
+    saved_status = cfg.get("last_config_status", "")
+    if saved_status:
+        if lines:
+            lines.append("")
+        lines.append(saved_status)
+    elif not lines:
+        lines.append(t("training_status_no_saved_config"))
+    return "\n".join(lines)
+
+
+def _finish_current_training(status: str, error: str = "") -> None:
+    with _training_lock:
+        _current_training["process"] = None
+        _current_training["thread"] = None
+        _current_training["status"] = status
+        _current_training["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        if error:
+            _current_training["error"] = error
+        _persist_current_training_unlocked()
+
+
 def stop_training() -> str:
     state = _get_current_training()
     process = state.get("process")
+    pid = getattr(process, "pid", None) if process is not None else None
     if process is None or process.poll() is not None:
+        persisted = _load_persisted_training_state()
+        pid = persisted.get("pid")
+        if not _pid_is_running(pid):
+            return t("stop_status_idle")
+        process = None
+
+    if not pid:
         return t("stop_status_idle")
 
     with _training_lock:
         _current_training["stop_requested"] = True
+        _current_training["status"] = "cancel_requested"
+        _persist_current_training_unlocked()
 
     try:
         if os.name == "nt":
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
             )
         else:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
     except Exception:
         try:
-            process.kill()
+            if process is not None:
+                process.kill()
+            elif pid:
+                os.kill(int(pid), signal.SIGTERM)
         except Exception:
             pass
 
-    manifest_path = state.get("manifest_path")
+    manifest_path = state.get("manifest_path") or _load_persisted_training_state().get("manifest_path")
     if manifest_path:
         update_run_manifest(
             manifest_path,
             status="cancel_requested",
-            log_file=state.get("log_file", ""),
+            log_file=state.get("log_file", "") or _load_persisted_training_state().get("log_file", ""),
             output_files=list_output_files(load_config().get("output_directory", "")),
         )
     return t("stop_status_requested")
@@ -1356,6 +1610,53 @@ def _read_tail(path: Path, max_lines: int = SAMPLE_LOG_TAIL_LINES) -> str:
     return "\n".join(lines).strip()
 
 
+def _sample_job_for_disk(job: dict) -> dict:
+    return {
+        key: value
+        for key, value in job.items()
+        if not str(key).startswith("_") and isinstance(value, (str, int, float, bool, type(None)))
+    }
+
+
+def _persist_sample_jobs_unlocked() -> None:
+    _write_json_atomic(SAMPLE_QUEUE_FILE, [_sample_job_for_disk(job) for job in _sample_jobs[-500:]])
+
+
+def load_sample_jobs_from_disk() -> None:
+    global _sample_job_counter
+    rows = _read_json_file(SAMPLE_QUEUE_FILE, [])
+    if not isinstance(rows, list):
+        return
+    loaded: list[dict] = []
+    max_id = 0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        job = dict(item)
+        if str(job.get("status", "")) in {"running", "deferred"}:
+            job["status"] = "failed:interrupted"
+            job["error"] = "The UI process restarted before this sample job reported completion."
+        try:
+            max_id = max(max_id, int(job.get("id") or 0))
+        except (TypeError, ValueError):
+            pass
+        loaded.append(job)
+    with _sample_lock:
+        if _sample_jobs:
+            return
+        _sample_jobs.extend(loaded[-500:])
+        _sample_job_counter = max(_sample_job_counter, max_id)
+        _persist_sample_jobs_unlocked()
+
+
+def _touch_sample_job(job: dict) -> None:
+    with _sample_lock:
+        if job not in _sample_jobs:
+            _assign_sample_job_id_unlocked(job)
+            _sample_jobs.append(job)
+        _persist_sample_jobs_unlocked()
+
+
 def _sample_status_label(job: dict) -> str:
     status = str(job.get("status", ""))
     if status == "running":
@@ -1462,6 +1763,7 @@ def clear_finished_sample_jobs():
         live_ids = {id(job) for job in _sample_jobs}
         _pending_sample_jobs[:] = [job for job in _pending_sample_jobs if id(job) in live_ids]
         removed = before - len(_sample_jobs)
+        _persist_sample_jobs_unlocked()
     return refresh_sample_queue_ui(t("sample_queue_cleared", count=removed))
 
 
@@ -1474,9 +1776,6 @@ def retry_latest_failed_sample():
         source = dict(failed_jobs[0]) if failed_jobs else None
     if not source:
         return refresh_sample_queue_ui(t("sample_retry_no_failed"))
-    if _is_training_active():
-        return refresh_sample_queue_ui(t("sample_training_active"))
-
     job, message = _build_sample_job(
         lora_path=str(source.get("lora", "")),
         prompt=str(source.get("prompt", "")),
@@ -1500,6 +1799,37 @@ def retry_latest_failed_sample():
 def _find_latest_lora(output_dir: str) -> str:
     files = scan_output_files(output_dir)
     return files[0]["path"] if files else ""
+
+
+def _lora_output_signature(row: dict) -> str:
+    return f"{row.get('path', '')}|{row.get('modified', '')}|{row.get('size_mb', '')}"
+
+
+def _seen_lora_signatures(output_dir: str) -> set[str]:
+    return {
+        _lora_output_signature(row)
+        for row in scan_output_files(output_dir)
+        if row.get("path")
+    }
+
+
+def _find_next_unseen_lora(output_dir: str, seen_loras: set[str]) -> tuple[str, str]:
+    # Oldest first pairs pending epoch requests with the checkpoint that appeared next.
+    now = time.time()
+    for row in reversed(scan_output_files(output_dir)):
+        signature = _lora_output_signature(row)
+        try:
+            file_age = now - float(row.get("modified", 0) or 0)
+        except (TypeError, ValueError):
+            file_age = SAMPLE_LORA_STABLE_SECONDS
+        if (
+            row.get("path")
+            and signature not in seen_loras
+            and float(row.get("size_mb", 0) or 0) > 0
+            and file_age >= SAMPLE_LORA_STABLE_SECONDS
+        ):
+            return str(row["path"]), signature
+    return "", ""
 
 
 def _build_sample_job(
@@ -1581,6 +1911,7 @@ def _register_sample_job(job: dict) -> None:
         _assign_sample_job_id_unlocked(job)
         if job not in _sample_jobs:
             _sample_jobs.append(job)
+        _persist_sample_jobs_unlocked()
 
 
 def _queue_sample_job(job: dict) -> None:
@@ -1591,6 +1922,7 @@ def _queue_sample_job(job: dict) -> None:
             _sample_jobs.append(job)
         if job not in _pending_sample_jobs:
             _pending_sample_jobs.append(job)
+        _persist_sample_jobs_unlocked()
 
 
 def _pop_pending_sample_jobs() -> list[dict]:
@@ -1606,6 +1938,7 @@ def _run_sample_job(job: dict) -> None:
     job["started_at"] = datetime.now().isoformat(timespec="seconds")
     job["_started_monotonic"] = time.monotonic()
     job.pop("_finished_monotonic", None)
+    _touch_sample_job(job)
     log_path = Path(job.get("log_path") or Path(job["output"]).with_suffix(".log"))
     cwd = Path(job.get("cwd") or ROOT)
     cmd = [
@@ -1652,6 +1985,7 @@ def _run_sample_job(job: dict) -> None:
         job["log_tail"] = _read_tail(log_path)
         job["finished_at"] = datetime.now().isoformat(timespec="seconds")
         job["_finished_monotonic"] = time.monotonic()
+        _touch_sample_job(job)
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = str(exc)
@@ -1665,6 +1999,7 @@ def _run_sample_job(job: dict) -> None:
             job["log_tail"] = _read_tail(log_path)
         except Exception:
             pass
+        _touch_sample_job(job)
 
 
 def launch_sample(
@@ -1684,8 +2019,6 @@ def launch_sample(
     )
     if job is None:
         return refresh_sample_queue_ui(message)
-    if _is_training_active():
-        return refresh_sample_queue_ui(t("sample_training_active"))
     _register_sample_job(job)
     threading.Thread(target=_run_sample_job, args=(job,), daemon=True).start()
     return refresh_sample_queue_ui(_format_sample_job(job))
@@ -1704,10 +2037,6 @@ def launch_sample_and_wait(
     base_model: str,
     diffsynth_dir: str = "",
 ):
-    if _is_training_active():
-        yield refresh_sample_queue_ui(t("sample_training_active"))
-        return
-
     sample_runtime_log: list[str] = []
     cfg = load_config()
     ds_dir = resolve_diffsynth_dir(diffsynth_dir or cfg.get("diffsynth_dir", ""))
@@ -1753,16 +2082,19 @@ def launch_sample_and_wait(
     yield refresh_sample_queue_ui(_format_sample_job(job))
 
 
-def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_loras: set[str]) -> str | None:
+def _should_auto_sample_epoch(epoch_index: int, cfg: dict) -> bool:
     if not cfg.get("sample_enabled"):
-        return None
+        return False
     every = max(int(cfg.get("sample_every_n_epochs", 1) or 1), 1)
-    if epoch_index <= 0 or epoch_index % every != 0:
+    return epoch_index > 0 and epoch_index % every == 0
+
+
+def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_loras: set[str]) -> str | None:
+    if not _should_auto_sample_epoch(epoch_index, cfg):
         return None
-    lora_path = _find_latest_lora(cfg.get("output_directory", ""))
-    if not lora_path or lora_path in seen_loras:
+    lora_path, signature = _find_next_unseen_lora(cfg.get("output_directory", ""), seen_loras)
+    if not lora_path:
         return None
-    seen_loras.add(lora_path)
 
     job, message = _build_sample_job(
         lora_path=lora_path,
@@ -1775,14 +2107,37 @@ def maybe_launch_auto_sample(epoch_index: int, cfg: dict, base_model: str, seen_
         seed=int(cfg.get("sample_seed", 42)) + epoch_index,
         low_vram=bool(cfg.get("sample_low_vram", False)),
         base_model=base_model,
+        diffsynth_dir=cfg.get("diffsynth_dir", ""),
     )
     if job is None:
         return message
-    if _is_training_active():
-        _queue_sample_job(job)
-        return t("sample_deferred_until_training_done", path=job["output"])
+    seen_loras.add(signature)
+    _register_sample_job(job)
     threading.Thread(target=_run_sample_job, args=(job,), daemon=True).start()
-    return _format_sample_job(job)
+    return t("sample_auto_started", epoch=epoch_index, path=job["output"])
+
+
+def maybe_launch_pending_auto_samples(
+    pending_epochs: set[int],
+    cfg: dict,
+    base_model: str,
+    seen_loras: set[str],
+) -> list[str]:
+    messages: list[str] = []
+    if not pending_epochs:
+        return messages
+    if not cfg.get("sample_enabled"):
+        pending_epochs.clear()
+        return messages
+    for epoch_index in sorted(list(pending_epochs)):
+        message = maybe_launch_auto_sample(epoch_index, cfg, base_model, seen_loras)
+        if not message:
+            continue
+        pending_epochs.discard(epoch_index)
+        messages.append(message)
+        # One new LoRA file should only be consumed by one epoch request.
+        break
+    return messages
 
 
 def run_pending_sample_jobs() -> list[str]:
@@ -1801,7 +2156,7 @@ def run_pending_sample_jobs() -> list[str]:
 # Training runner (generator — streams logs live to Gradio)
 # ---------------------------------------------------------------------------
 
-def start_training(
+def _start_training_stream(
     backend: str,
     diffsynth_dir: str,
     custom_config_path: str,
@@ -1822,11 +2177,17 @@ def start_training(
         now = time.monotonic()
         if force or now - last_emit >= 0.35:
             last_emit = now
-            return log_buffer.text()
+            text = log_buffer.text()
+            _update_current_training_tail(text)
+            return text
         return None
 
     def emit_force(line: str):
-        return log_buffer.text() if line is None else emit(line, force=True)
+        if line is None:
+            text = log_buffer.text()
+            _update_current_training_tail(text)
+            return text
+        return emit(line, force=True)
 
     # --- Auto-download DiT model if needed ---
     dit_model = get_dit_model_path(base_model)
@@ -2062,6 +2423,13 @@ def start_training(
         preflight=[check.to_dict() for check in preflight_checks],
     )
     save_config({"last_run_manifest": manifest_path})
+    _set_current_training(
+        manifest_path=manifest_path,
+        log_file=str(log_file_path),
+        status="starting",
+        backend=backend,
+        project_name=project_name,
+    )
     yield emit_force(t("info_manifest_written", path=manifest_path))
     if has_failures(preflight_checks):
         update_run_manifest(
@@ -2072,6 +2440,7 @@ def start_training(
             output_files=list_output_files(output_dir),
         )
         yield emit_force(t("info_preflight_failed"))
+        _finish_current_training("preflight_failed")
         return
     yield emit_force("")
 
@@ -2080,8 +2449,10 @@ def start_training(
         estimate_progress_total_from_config(backend, saved_cfg),
         expected_epoch_total=expected_epoch_total,
     )
-    samples_seen: set[str] = set()
-    last_epoch_sampled = 0
+    samples_seen = _seen_lora_signatures(saved_cfg.get("output_directory", ""))
+    pending_auto_sample_epochs: set[int] = set()
+    last_epoch_seen = 0
+    tqdm_epoch_completed = False
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_idx
@@ -2100,7 +2471,14 @@ def start_training(
             errors="ignore",
             **_process_popen_kwargs(),
         )
-        _set_current_training(process, manifest_path, str(log_file_path))
+        _set_current_training(
+            process=process,
+            manifest_path=manifest_path,
+            log_file=str(log_file_path),
+            status="running",
+            backend=backend,
+            project_name=project_name,
+        )
     except FileNotFoundError:
         yield emit_force(t("err_accelerate_missing"))
         if loss_writer:
@@ -2139,34 +2517,55 @@ def start_training(
                     epoch_index = int(structured.get("epoch", 0))
                 except (TypeError, ValueError):
                     epoch_current = epoch_total = epoch_index = 0
-                if epoch_total == expected_epoch_total and epoch_current >= epoch_total and epoch_index > last_epoch_sampled:
-                    last_epoch_sampled = epoch_index
-                    sample_status = maybe_launch_auto_sample(epoch_index, saved_cfg, base_model, samples_seen)
-                    if sample_status:
-                        log_f.write(sample_status + "\n")
-                        text = emit(sample_status, force=True)
-                        if text is not None:
-                            yield text
+                if epoch_total == expected_epoch_total and epoch_current >= epoch_total and epoch_index > last_epoch_seen:
+                    last_epoch_seen = epoch_index
+                    if _should_auto_sample_epoch(epoch_index, saved_cfg):
+                        pending_auto_sample_epochs.add(epoch_index)
             parsed = None if structured else parse_tqdm_progress(line)
             if parsed:
                 current, total = parsed
-                if total and current >= total and (not expected_epoch_total or total == expected_epoch_total):
-                    last_epoch_sampled += 1
-                    sample_status = maybe_launch_auto_sample(last_epoch_sampled, saved_cfg, base_model, samples_seen)
-                    if sample_status:
-                        log_f.write(sample_status + "\n")
-                        text = emit(sample_status, force=True)
-                        if text is not None:
-                            yield text
+                if total and current < total:
+                    tqdm_epoch_completed = False
+                if (
+                    total
+                    and current >= total
+                    and (not expected_epoch_total or total == expected_epoch_total)
+                    and not tqdm_epoch_completed
+                ):
+                    tqdm_epoch_completed = True
+                    last_epoch_seen += 1
+                    if _should_auto_sample_epoch(last_epoch_seen, saved_cfg):
+                        pending_auto_sample_epochs.add(last_epoch_seen)
+            for sample_status in maybe_launch_pending_auto_samples(
+                pending_auto_sample_epochs, saved_cfg, base_model, samples_seen
+            ):
+                log_f.write(sample_status + "\n")
+                log_f.flush()
+                text = emit(sample_status, force=True)
+                if text is not None:
+                    yield text
             text = emit(line)
             if text is not None:
                 yield text
 
     exit_code = process.wait()
     stop_requested = bool(_get_current_training().get("stop_requested"))
-    _set_current_training()
     if loss_writer:
         loss_writer.close()
+
+    if pending_auto_sample_epochs:
+        deadline = time.monotonic() + 15
+        while pending_auto_sample_epochs and time.monotonic() < deadline:
+            messages = maybe_launch_pending_auto_samples(
+                pending_auto_sample_epochs, saved_cfg, base_model, samples_seen
+            )
+            if messages:
+                for sample_status in messages:
+                    text = emit(sample_status, force=True)
+                    if text is not None:
+                        yield text
+                continue
+            time.sleep(1)
 
     pending_sample_messages = run_pending_sample_jobs()
     if pending_sample_messages:
@@ -2195,6 +2594,118 @@ def start_training(
                 yield emit_force(t("info_oom_hint"))
         except Exception:
             pass
+
+    _finish_current_training(status)
+
+
+def _consume_training_stream(args: tuple) -> None:
+    try:
+        for _ in _start_training_stream(*args):
+            pass
+    except Exception:
+        error = traceback.format_exc()
+        state = _get_current_training()
+        process = state.get("process")
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        current_tail = restored_training_log()
+        combined = (current_tail + "\n\n" + error).strip() if current_tail else error
+        _update_current_training_tail(combined)
+        manifest_path = state.get("manifest_path", "")
+        if manifest_path:
+            try:
+                update_run_manifest(
+                    manifest_path,
+                    status="failed",
+                    log_file=state.get("log_file", ""),
+                    error=error,
+                    output_files=list_output_files(load_config().get("output_directory", "")),
+                )
+            except Exception:
+                pass
+        _finish_current_training("failed", error)
+        return
+
+    state = _get_current_training()
+    if state.get("status") in {"starting", "running", "cancel_requested"}:
+        manifest_status = ""
+        manifest_path = state.get("manifest_path", "")
+        if manifest_path:
+            manifest_payload = _read_json_file(Path(manifest_path), {})
+            manifest_status = str(manifest_payload.get("status", ""))
+        final_status = manifest_status if manifest_status and manifest_status != "created" else "failed"
+        if state.get("stop_requested"):
+            final_status = "cancelled"
+        _finish_current_training(final_status)
+
+
+def start_training(
+    backend: str,
+    diffsynth_dir: str,
+    custom_config_path: str,
+    gpu_index_choice: str,
+    num_cpu_threads_per_process: int,
+    base_model: str,
+    use_tensorboard: bool,
+) -> str:
+    if _is_training_busy():
+        active = _get_current_training()
+        pid = getattr(active.get("process"), "pid", "")
+        log_text = restored_training_log()
+        prefix = t("training_status_already_running", pid=pid)
+        return (prefix + "\n\n" + log_text).strip()
+
+    persisted = _load_persisted_training_state()
+    if persisted.get("status") in {"starting", "running", "cancel_requested"} and _pid_is_running(persisted.get("pid")):
+        log_text = restored_training_log()
+        prefix = t("training_status_detached", pid=persisted.get("pid"))
+        return (prefix + "\n\n" + log_text).strip()
+
+    cfg = load_config()
+    started = datetime.now().isoformat(timespec="seconds")
+    message = t(
+        "training_started_background",
+        project=cfg.get("project_name", ""),
+        backend=(backend or cfg.get("backend", "kohya")),
+    )
+    _set_current_training(
+        process=None,
+        thread=None,
+        manifest_path="",
+        log_file="",
+        status="starting",
+        stop_requested=False,
+        started_at=started,
+        finished_at="",
+        backend=(backend or cfg.get("backend", "kohya")),
+        project_name=cfg.get("project_name", ""),
+        last_log_tail=message,
+        clear_error=True,
+    )
+    args = (
+        backend,
+        diffsynth_dir,
+        custom_config_path,
+        gpu_index_choice,
+        num_cpu_threads_per_process,
+        base_model,
+        use_tensorboard,
+    )
+    thread = threading.Thread(target=_consume_training_stream, args=(args,), daemon=True)
+    _set_current_training(thread=thread)
+    thread.start()
+    return restored_training_log()
+
+
+def refresh_training_ui():
+    load_sample_jobs_from_disk()
+    return restored_config_status(), restored_training_log(), *refresh_sample_queue_ui()
 
 
 # ---------------------------------------------------------------------------
@@ -2360,14 +2871,12 @@ def _empty_iframe() -> str:
 # ---------------------------------------------------------------------------
 
 def build_ui() -> gr.Blocks:
+    load_sample_jobs_from_disk()
     cfg = load_config()
     current_lang = get_lang()
 
     saved_gpu_idx = str(cfg.get("gpu_index", "0"))
-    default_gpu = next(
-        (c for c in GPU_CHOICES if c.startswith(saved_gpu_idx + ":")),
-        GPU_CHOICES[0] if GPU_CHOICES else "0",
-    )
+    default_gpu = gpu_choice_from_index(saved_gpu_idx)
 
     is_diffsynth = cfg.get("backend", "kohya") == "diffsynth"
 
@@ -2452,6 +2961,7 @@ def build_ui() -> gr.Blocks:
                     configure_btn = gr.Button(t("btn_configure"), variant="secondary", size="lg")
                     train_btn = gr.Button(t("btn_start"), variant="primary", size="lg")
                     stop_train_btn = gr.Button(t("btn_stop_training"), variant="stop", size="lg")
+                    refresh_training_btn = gr.Button(t("btn_refresh_training_status"), variant="secondary", size="lg")
 
                 custom_config_input = gr.Textbox(
                     label=t("override_config_label"),
@@ -2459,9 +2969,22 @@ def build_ui() -> gr.Blocks:
                     placeholder="/path/to/custom_training_config.toml",
                 )
 
-                status_box = gr.Textbox(label=t("status_label"), lines=14, interactive=False, show_copy_button=True)
+                status_box = gr.Textbox(
+                    label=t("status_label"),
+                    value=restored_config_status(),
+                    lines=14,
+                    interactive=False,
+                    show_copy_button=True,
+                )
                 stop_status_md = gr.Markdown("")
-                log_box = gr.Textbox(label=t("log_label"), lines=25, interactive=False, show_copy_button=True, autoscroll=True)
+                log_box = gr.Textbox(
+                    label=t("log_label"),
+                    value=restored_training_log(),
+                    lines=25,
+                    interactive=False,
+                    show_copy_button=True,
+                    autoscroll=True,
+                )
 
             # ================================================================
             # TAB 2 — Advanced Settings
@@ -2755,6 +3278,80 @@ def build_ui() -> gr.Blocks:
         diffsynth_inputs = [lora_target_modules_in, dataset_repeat_in, max_pixels_in, save_steps_ds_in]
         tb_inputs = [use_tb_chk, tb_logdir_in, tb_port_in]
 
+        restore_outputs = [
+            language_dd, backend_radio,
+            project_name, gpu_dropdown, base_model_dropdown, image_directory, output_directory,
+            network_dim, network_alpha, learning_rate, max_train_epochs,
+            resolution, repeats, caption_dropout,
+            custom_config_input, status_box, stop_status_md, log_box,
+            diffsynth_group, lora_target_modules_in, dataset_repeat_in, max_pixels_in, save_steps_ds_in,
+            diffsynth_dir_in, diffsynth_param_table,
+            kohya_optimizer_group, optimizer_type, lr_scheduler, lr_scheduler_num_cycles, lr_warmup_steps,
+            train_batch_size, gradient_accumulation_steps, max_grad_norm,
+            kohya_saving_group, save_every_n_epochs, save_last_n_epochs,
+            mixed_precision, gradient_checkpointing, seed, noise_offset, multires_noise_discount,
+            timestep_sampling, discrete_flow_shift,
+            cache_latents, cache_text_encoder_outputs, vae_chunk_size, vae_disable_cache,
+            kohya_noise_group,
+            resume_lora_path_in, num_cpu_threads, log_tail_lines,
+            use_tb_chk, tb_logdir_in, tb_port_in, ngrok_enable_chk, ngrok_token_in,
+            sample_enabled, sample_every_n_epochs, sample_low_vram,
+            sample_prompt, sample_negative_prompt, sample_width, sample_height,
+            sample_steps, sample_cfg_scale, sample_seed, sample_status_md,
+            sample_lora_path, sample_queue_table, sample_gallery,
+            model_table, model_log_box, history_table,
+            outputs_dir_input, latest_output_md, outputs_table,
+            last_train_cfg, last_dataset_cfg, last_diffsynth_args, last_tb_logdir_state,
+        ]
+
+        def _restore_ui_state():
+            latest_cfg = load_config()
+            ds = latest_cfg.get("backend", "kohya") == "diffsynth"
+            status, log, sample_status, sample_queue, gallery = refresh_training_ui()
+            return (
+                get_lang(), latest_cfg.get("backend", "kohya"),
+                latest_cfg["project_name"], gpu_choice_from_index(latest_cfg.get("gpu_index", "0")),
+                latest_cfg.get("base_model", "anima-base-v1.0"),
+                latest_cfg["image_directory"], latest_cfg["output_directory"],
+                latest_cfg["network_dim"], gr.update(value=latest_cfg["network_alpha"], visible=not ds),
+                latest_cfg["learning_rate"], latest_cfg["max_train_epochs"],
+                gr.update(value=latest_cfg["resolution"], visible=not ds),
+                gr.update(value=latest_cfg["repeats"], visible=not ds),
+                gr.update(value=latest_cfg["caption_dropout"], visible=not ds),
+                "", status, "", log,
+                gr.update(visible=ds), latest_cfg["lora_target_modules"], latest_cfg["dataset_repeat"],
+                latest_cfg["max_pixels"], latest_cfg["save_steps_ds"], latest_cfg["diffsynth_dir"],
+                refresh_diffsynth_param_table(latest_cfg.get("last_diffsynth_args", "")),
+                gr.update(visible=not ds), latest_cfg["optimizer_type"], latest_cfg["lr_scheduler"],
+                latest_cfg["lr_scheduler_num_cycles"], latest_cfg["lr_warmup_steps"],
+                gr.update(value=latest_cfg["train_batch_size"], visible=not ds),
+                latest_cfg["gradient_accumulation_steps"],
+                gr.update(value=latest_cfg["max_grad_norm"], visible=not ds),
+                gr.update(visible=not ds), latest_cfg["save_every_n_epochs"], latest_cfg["save_last_n_epochs"],
+                latest_cfg["mixed_precision"], latest_cfg["gradient_checkpointing"], latest_cfg["seed"],
+                latest_cfg["noise_offset"], latest_cfg["multires_noise_discount"],
+                latest_cfg["timestep_sampling"], latest_cfg["discrete_flow_shift"],
+                gr.update(value=latest_cfg["cache_latents"], visible=not ds),
+                gr.update(value=latest_cfg["cache_text_encoder_outputs"], visible=not ds),
+                gr.update(value=latest_cfg["vae_chunk_size"], visible=not ds),
+                gr.update(value=latest_cfg["vae_disable_cache"], visible=not ds),
+                gr.update(visible=not ds),
+                latest_cfg.get("resume_lora_path", ""), latest_cfg["num_cpu_threads_per_process"],
+                latest_cfg["log_tail_lines"],
+                latest_cfg["use_tensorboard"], latest_cfg.get("last_tb_logdir", "") or latest_cfg.get("tb_logdir", ""),
+                latest_cfg["tb_port"], latest_cfg.get("ngrok_enable", False), latest_cfg.get("ngrok_token", ""),
+                latest_cfg["sample_enabled"], latest_cfg["sample_every_n_epochs"], latest_cfg["sample_low_vram"],
+                latest_cfg["sample_prompt"], latest_cfg["sample_negative_prompt"], latest_cfg["sample_width"],
+                latest_cfg["sample_height"], latest_cfg["sample_steps"], latest_cfg["sample_cfg_scale"],
+                latest_cfg["sample_seed"], sample_status,
+                "", sample_queue, gallery,
+                refresh_model_table(latest_cfg.get("base_model", "anima-base-v1.0"), latest_cfg.get("diffsynth_dir", "")),
+                "", refresh_history_table(),
+                latest_cfg.get("output_directory", ""), "", refresh_outputs_table(latest_cfg.get("output_directory", "")),
+                latest_cfg.get("last_train_config", ""), latest_cfg.get("last_dataset_config", ""),
+                latest_cfg.get("last_diffsynth_args", ""), latest_cfg.get("last_tb_logdir", ""),
+            )
+
         # ── Configure Training event ─────────────────────────────────────
         def _configure_training_ui(*args):
             result = configure_training(*args)
@@ -2774,6 +3371,13 @@ def build_ui() -> gr.Blocks:
             outputs=[log_box],
         )
         stop_train_btn.click(fn=stop_training, inputs=[], outputs=[stop_status_md])
+        refresh_training_btn.click(
+            fn=refresh_training_ui,
+            inputs=[],
+            outputs=[status_box, log_box, sample_status_md, sample_queue_table, sample_gallery],
+            show_progress="hidden",
+            queue=False,
+        )
 
         # ── Sample controls ──────────────────────────────────────────────
         sample_inputs = [
@@ -2835,6 +3439,20 @@ def build_ui() -> gr.Blocks:
             outputs=[tb_status_md, tb_iframe],
         )
         stop_tb_btn.click(fn=stop_tensorboard, inputs=[], outputs=[tb_status_md, tb_iframe])
+
+        demo.load(fn=_restore_ui_state, inputs=[], outputs=restore_outputs, show_progress="hidden", queue=False)
+        if hasattr(gr, "Timer"):
+            try:
+                training_timer = gr.Timer(value=TRAINING_POLL_SECONDS, active=True)
+            except TypeError:
+                training_timer = gr.Timer(value=TRAINING_POLL_SECONDS)
+            training_timer.tick(
+                fn=refresh_training_ui,
+                inputs=[],
+                outputs=[status_box, log_box, sample_status_md, sample_queue_table, sample_gallery],
+                show_progress="hidden",
+                queue=False,
+            )
 
     return demo
 
