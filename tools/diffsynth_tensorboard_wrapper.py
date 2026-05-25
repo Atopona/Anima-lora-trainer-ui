@@ -9,6 +9,7 @@ training code without editing the checked-out DiffSynth-Studio tree.
 from __future__ import annotations
 
 import argparse
+import json
 import runpy
 import sys
 from pathlib import Path
@@ -17,7 +18,10 @@ from pathlib import Path
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--diffsynth-train-script", required=True)
-    parser.add_argument("--tensorboard-logdir", required=True)
+    parser.add_argument("--tensorboard-logdir", default="")
+    parser.add_argument("--expected-total", type=int, default=0)
+    parser.add_argument("--expected-epoch-total", type=int, default=0)
+    parser.add_argument("--expected-epochs", type=int, default=0)
     return parser.parse_known_args(argv)
 
 
@@ -38,7 +42,25 @@ def _loss_to_float(loss) -> float | None:
         return None
 
 
-def _patch_model_logger(log_dir: str):
+def _progress_event(step: int, total: int, epoch_total: int, epochs: int) -> dict:
+    event = {
+        "source": "diffsynth_logger",
+        "step": int(step),
+        "total": int(total) if total else 0,
+        "epoch_total": int(epoch_total) if epoch_total else 0,
+        "epochs": int(epochs) if epochs else 0,
+    }
+    if epoch_total:
+        event["epoch"] = ((int(step) - 1) // int(epoch_total)) + 1
+        event["epoch_step"] = ((int(step) - 1) % int(epoch_total)) + 1
+    return event
+
+
+def _emit_progress(step: int, total: int, epoch_total: int, epochs: int) -> None:
+    print("__ANIMA_PROGRESS__" + json.dumps(_progress_event(step, total, epoch_total, epochs), separators=(",", ":")), flush=True)
+
+
+def _patch_model_logger(log_dir: str, expected_total: int, expected_epoch_total: int, expected_epochs: int):
     import diffsynth.diffusion as diffusion
     import diffsynth.diffusion.logger as logger_module
 
@@ -49,9 +71,14 @@ def _patch_model_logger(log_dir: str):
             super().__init__(*args, **kwargs)
             self._tb_writer = None
             self._tb_log_dir = log_dir
+            self._expected_total = max(int(expected_total or 0), 0)
+            self._expected_epoch_total = max(int(expected_epoch_total or 0), 0)
+            self._expected_epochs = max(int(expected_epochs or 0), 0)
 
         def _writer(self):
             if self._tb_writer is None:
+                if not self._tb_log_dir:
+                    return None
                 from torch.utils.tensorboard import SummaryWriter
 
                 Path(self._tb_log_dir).mkdir(parents=True, exist_ok=True)
@@ -62,10 +89,18 @@ def _patch_model_logger(log_dir: str):
             super().on_step_end(accelerator, model, save_steps, **kwargs)
             if not getattr(accelerator, "is_main_process", True):
                 return
+            _emit_progress(
+                self.num_steps,
+                self._expected_total,
+                self._expected_epoch_total,
+                self._expected_epochs,
+            )
             value = _loss_to_float(kwargs.get("loss"))
             if value is None:
                 return
             writer = self._writer()
+            if writer is None:
+                return
             writer.add_scalar("loss", value, self.num_steps)
             writer.add_scalar("train/loss", value, self.num_steps)
             if self.num_steps % 10 == 0:
@@ -86,7 +121,12 @@ def _patch_model_logger(log_dir: str):
 def main() -> None:
     args, train_args = _parse_args(sys.argv[1:])
     train_script = str(Path(args.diffsynth_train_script).resolve())
-    _patch_model_logger(args.tensorboard_logdir)
+    _patch_model_logger(
+        args.tensorboard_logdir,
+        args.expected_total,
+        args.expected_epoch_total,
+        args.expected_epochs,
+    )
     sys.argv = [train_script, *train_args]
     runpy.run_path(train_script, run_name="__main__")
 

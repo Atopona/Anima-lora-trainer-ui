@@ -137,14 +137,23 @@ echo       accelerate configured.
 :: 7. Download Anima models (idempotent)
 :: -----------------------------------------------------------------------------
 echo.
-echo [7/7] Downloading Anima support models (~1.4 GB total)...
-echo       (The DiT base model will be downloaded automatically when you start training.)
+echo [7/7] Downloading Anima and DiffSynth models...
 echo       This may take a while depending on your connection.
 echo.
 
 if not exist "models\anima\dit"          mkdir models\anima\dit
 if not exist "models\anima\text_encoder" mkdir models\anima\text_encoder
 if not exist "models\anima\vae"          mkdir models\anima\vae
+
+if not exist "models\anima\dit\anima-base-v1.0.safetensors" (
+    echo   Downloading default Anima DiT base model (~3.9 GB)...
+    curl -L -C - --progress-bar ^
+        -o "models\anima\dit\anima-base-v1.0.safetensors" ^
+        "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors"
+    echo   Anima DiT base model downloaded.
+) else (
+    echo   Anima DiT base model already present -- skipping.
+)
 
 if not exist "models\anima\text_encoder\qwen_3_06b_base.safetensors" (
     echo   Downloading Qwen3 text encoder (1.19 GB)...
@@ -164,6 +173,15 @@ if not exist "models\anima\vae\qwen_image_vae.safetensors" (
     echo   VAE model downloaded.
 ) else (
     echo   VAE model already present -- skipping.
+)
+
+if not "%SKIP_DIFFSYNTH%"=="1" (
+    if exist "DiffSynth-Studio" (
+        echo.
+        echo   Downloading DiffSynth tokenizer/support files...
+        python tools\download_diffsynth_support.py --diffsynth-dir DiffSynth-Studio
+        echo   DiffSynth tokenizer/support files ready.
+    )
 )
 
 echo.

@@ -74,13 +74,30 @@ def scan_output_files(output_dir: str | Path) -> list[dict]:
     return rows
 
 
+def _path_status(path: Path) -> tuple[bool, float]:
+    if not path.exists():
+        return False, 0.0
+    if path.is_file():
+        return True, round(path.stat().st_size / (1024 ** 3), 2)
+    total = 0
+    has_file = False
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        has_file = True
+        try:
+            total += item.stat().st_size
+        except OSError:
+            pass
+    return has_file, round(total / (1024 ** 3), 2)
+
+
 def model_status_rows(model_paths: dict[str, str], urls: dict[str, str] | None = None) -> list[dict]:
     rows = []
     urls = urls or {}
     for label, value in model_paths.items():
         path = Path(value)
-        exists = path.exists()
-        size_gb = round(path.stat().st_size / (1024 ** 3), 2) if exists else 0.0
+        exists, size_gb = _path_status(path)
         rows.append({
             "model": label,
             "status": "ready" if exists else "missing",

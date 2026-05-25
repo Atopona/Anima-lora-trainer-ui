@@ -9,6 +9,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit", required=True)
     parser.add_argument("--qwen3", required=True)
     parser.add_argument("--vae", required=True)
+    parser.add_argument("--qwen_tokenizer", default="")
+    parser.add_argument("--sd35_tokenizer", default="")
     parser.add_argument("--lora", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", required=True)
@@ -29,6 +31,9 @@ def main() -> None:
 
     for path in (args.dit, args.qwen3, args.vae, args.lora):
         if not Path(path).exists():
+            raise FileNotFoundError(path)
+    for path in (args.qwen_tokenizer, args.sd35_tokenizer):
+        if path and not Path(path).exists():
             raise FileNotFoundError(path)
 
     vram_config = {}
@@ -52,8 +57,12 @@ def main() -> None:
             ModelConfig(path=args.qwen3, **vram_config),
             ModelConfig(path=args.vae, **vram_config),
         ],
-        tokenizer_config=ModelConfig(model_id="Qwen/Qwen3-0.6B", origin_file_pattern="./"),
-        tokenizer_t5xxl_config=ModelConfig(model_id="stabilityai/stable-diffusion-3.5-large", origin_file_pattern="tokenizer_3/"),
+        tokenizer_config=ModelConfig(args.qwen_tokenizer)
+        if args.qwen_tokenizer
+        else ModelConfig(model_id="Qwen/Qwen3-0.6B", origin_file_pattern="./"),
+        tokenizer_t5xxl_config=ModelConfig(args.sd35_tokenizer)
+        if args.sd35_tokenizer
+        else ModelConfig(model_id="stabilityai/stable-diffusion-3.5-large", origin_file_pattern="tokenizer_3/"),
         vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 0.5 if torch.cuda.is_available() else None,
     )
     pipe.load_lora(pipe.dit, args.lora)

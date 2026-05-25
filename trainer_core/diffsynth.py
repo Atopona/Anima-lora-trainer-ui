@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .dataset import migrate_diffsynth_metadata_for_anima
@@ -10,6 +11,50 @@ from .dataset import migrate_diffsynth_metadata_for_anima
 LEGACY_ANIMA_TARGET_MODULES = "q,k,v,o,ffn.0,ffn.2"
 TORCHAO_MIN_EXCLUSIVE_VERSION = (0, 16, 0)
 TORCHAO_PIP_SPEC = "torchao>0.16.0"
+
+
+@dataclass(frozen=True)
+class DiffSynthParameter:
+    name: str
+    cli_arg: str
+    note: str
+
+
+APPLIED_PARAMETERS: tuple[DiffSynthParameter, ...] = (
+    DiffSynthParameter("Dataset base path", "--dataset_base_path", "Image root used with metadata image paths."),
+    DiffSynthParameter("Metadata CSV", "--dataset_metadata_path", "CSV with image,prompt columns."),
+    DiffSynthParameter("Data file keys", "--data_file_keys", "Always image for Anima metadata."),
+    DiffSynthParameter("Max pixels", "--max_pixels", "Dynamic resolution pixel budget."),
+    DiffSynthParameter("Dataset repeat", "--dataset_repeat", "DiffSynth repeat count per epoch."),
+    DiffSynthParameter("Model paths", "--model_paths", "DiT, Qwen3 text encoder, and VAE safetensors."),
+    DiffSynthParameter("Learning rate", "--learning_rate", "Optimizer learning rate used by DiffSynth."),
+    DiffSynthParameter("Epochs", "--num_epochs", "Number of full dataset passes."),
+    DiffSynthParameter("Output path", "--output_path", "Where LoRA checkpoints are saved."),
+    DiffSynthParameter("LoRA base model", "--lora_base_model", "Fixed to dit for Anima LoRA."),
+    DiffSynthParameter("LoRA target modules", "--lora_target_modules", "Blank lets DiffSynth auto-detect Anima modules."),
+    DiffSynthParameter("LoRA rank", "--lora_rank", "Uses the UI Network Dim value."),
+    DiffSynthParameter("Gradient accumulation", "--gradient_accumulation_steps", "Affects optimizer stepping, not per-step batch VRAM."),
+    DiffSynthParameter("Gradient checkpointing", "--use_gradient_checkpointing", "Boolean flag when enabled."),
+    DiffSynthParameter("Save steps", "--save_steps", "Only present when greater than 0."),
+    DiffSynthParameter("Resume checkpoint", "--lora_checkpoint", "Only present when continuing from an existing LoRA."),
+)
+
+IGNORED_KOHYA_PARAMETERS: tuple[str, ...] = (
+    "Network Alpha",
+    "Train Batch Size",
+    "Max Grad Norm",
+    "Optimizer",
+    "LR Scheduler",
+    "Resolution",
+    "Kohya Repeats",
+    "Caption Dropout",
+    "Latent Cache",
+    "Text Encoder Cache",
+    "VAE Chunk Size",
+    "Noise Offset",
+    "Multires Noise",
+    "Timestep Sampling",
+)
 
 
 def normalize_lora_target_modules(value: str) -> str:
@@ -69,6 +114,46 @@ def is_version_at_most(value: str, limit: tuple[int, ...]) -> bool:
     return parsed + (0,) * (max_len - len(parsed)) <= limit + (0,) * (max_len - len(limit))
 
 
+def get_arg_value(args: list[str], key: str, default: str = "") -> str:
+    try:
+        idx = args.index(key)
+    except ValueError:
+        return default
+    value_idx = idx + 1
+    return args[value_idx] if value_idx < len(args) else default
+
+
+def parameter_rows_from_args(args: list[str]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    flags = set(args)
+    for spec in APPLIED_PARAMETERS:
+        if spec.cli_arg in flags:
+            if spec.cli_arg in {"--use_gradient_checkpointing"}:
+                value = "enabled"
+            else:
+                value = get_arg_value(args, spec.cli_arg)
+            status = "applied"
+        else:
+            value = ""
+            status = "optional/off"
+        rows.append({
+            "parameter": spec.name,
+            "diffsynth_arg": spec.cli_arg,
+            "value": value,
+            "status": status,
+            "note": spec.note,
+        })
+    for name in IGNORED_KOHYA_PARAMETERS:
+        rows.append({
+            "parameter": name,
+            "diffsynth_arg": "",
+            "value": "",
+            "status": "not used by DiffSynth",
+            "note": "This is a Kohya-only UI setting and is intentionally not passed.",
+        })
+    return rows
+
+
 def create_training_args(
     *,
     args_path: Path,
@@ -119,4 +204,3 @@ def create_training_args(
     with open(args_path, "w", encoding="utf-8") as f:
         json.dump(args, f, indent=2, ensure_ascii=False)
     return args, str(args_path)
-

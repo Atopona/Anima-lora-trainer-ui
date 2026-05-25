@@ -3,12 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trainer_core import diffsynth, steps
+from trainer_core import diffsynth, diffsynth_support, steps
 from trainer_core.backends import build_diffsynth_run_spec, build_kohya_run_spec
 from trainer_core.catalog import model_status_rows, scan_output_files, scan_run_manifests
 from trainer_core.dataset import generate_diffsynth_metadata, migrate_diffsynth_metadata_for_anima
 from trainer_core.manifest import create_run_manifest
-from trainer_core.progress import ProgressTracker, parse_tqdm_progress
+from trainer_core.progress import ProgressTracker, parse_structured_progress, parse_tqdm_progress
+from trainer_core.sample_queue import format_sample_elapsed, is_terminal_sample_status
 
 
 class TrainerCoreTests(unittest.TestCase):
@@ -26,6 +27,14 @@ class TrainerCoreTests(unittest.TestCase):
         self.assertEqual(estimate["progress_per_epoch"], 2055)
         self.assertEqual(estimate["progress_total"], 20550)
         self.assertEqual(estimate["optimizer_total"], 20550)
+
+    def test_sample_queue_status_and_elapsed_formatting(self):
+        self.assertTrue(is_terminal_sample_status("done"))
+        self.assertTrue(is_terminal_sample_status("failed:1"))
+        self.assertFalse(is_terminal_sample_status("running"))
+        self.assertEqual(format_sample_elapsed(5), "5s")
+        self.assertEqual(format_sample_elapsed(65), "1m 5s")
+        self.assertEqual(format_sample_elapsed(3661), "1h 1m 1s")
 
     def test_legacy_diffsynth_lora_targets_migrate_to_anima_defaults(self):
         self.assertEqual(diffsynth.normalize_lora_target_modules("q,k,v,o,ffn.0,ffn.2"), "")
@@ -96,12 +105,60 @@ class TrainerCoreTests(unittest.TestCase):
         self.assertNotIn("--train_batch_size", args)
 
     def test_progress_tracker_accumulates_reset_epochs(self):
-        tracker = ProgressTracker(expected_total=30)
+        tracker = ProgressTracker(expected_total=30, expected_epoch_total=20)
 
         self.assertEqual(parse_tqdm_progress("10/20 [00:01<00:01]"), (10, 20))
-        self.assertEqual(tracker.feed("10/20 [00:01<00:01]"), "[progress] 10/30 (33.3%)")
-        self.assertEqual(tracker.feed("20/20 [00:02<00:00]"), "[progress] 20/30 (66.7%)")
-        self.assertEqual(tracker.feed("1/10 [00:00<00:01]"), "[progress] 21/30 (70.0%)")
+        self.assertEqual(
+            tracker.feed("10/20 [00:01<00:01]"),
+            "[progress] epoch 1/2: 10/20 (50.0%), total 10/30 (33.3%)",
+        )
+        self.assertEqual(
+            tracker.feed("20/20 [00:02<00:00]"),
+            "[progress] epoch 1/2: 20/20 (100.0%), total 20/30 (66.7%)",
+        )
+        self.assertEqual(tracker.feed("1/10 [00:00<00:01]"), None)
+
+    def test_progress_tracker_ignores_non_training_tqdm_totals(self):
+        tracker = ProgressTracker(expected_total=8220, expected_epoch_total=822)
+
+        self.assertIsNone(tracker.feed("100/1000 [00:01<00:09]"))
+        self.assertEqual(
+            tracker.feed("528/822 [04:27<02:30, 1.96it/s]"),
+            "[progress] epoch 1/10: 528/822 (64.2%), total 528/8220 (6.4%)",
+        )
+
+    def test_progress_tracker_prefers_structured_diffsynth_events(self):
+        tracker = ProgressTracker(expected_total=8220, expected_epoch_total=822)
+        line = '__ANIMA_PROGRESS__{"source":"diffsynth_logger","step":823,"total":8220,"epoch":2,"epochs":10,"epoch_step":1,"epoch_total":822}'
+
+        event = parse_structured_progress(line)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["step"], 823)
+        self.assertEqual(
+            tracker.feed(line),
+            "[progress:diffsynth_logger] epoch 2/10: 1/822 (0.1%), total 823/8220 (10.0%)",
+        )
+        self.assertIsNone(tracker.feed("100/1000 [00:01<00:09]"))
+
+    def test_diffsynth_parameter_rows_mark_kohya_only_settings(self):
+        rows = diffsynth.parameter_rows_from_args(["--lora_rank", "20", "--learning_rate", "0.0001"])
+        by_name = {row["parameter"]: row for row in rows}
+
+        self.assertEqual(by_name["LoRA rank"]["value"], "20")
+        self.assertEqual(by_name["Learning rate"]["value"], "0.0001")
+        self.assertEqual(by_name["Train Batch Size"]["status"], "not used by DiffSynth")
+
+    def test_diffsynth_support_paths_and_directory_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = diffsynth_support.SUPPORT_SPECS[0]
+            path = diffsynth_support.support_path(spec, root)
+            self.assertFalse(diffsynth_support.is_support_ready(spec, root))
+            path.mkdir(parents=True)
+            (path / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            self.assertTrue(diffsynth_support.is_support_ready(spec, root))
+            self.assertGreater(diffsynth_support.path_size_bytes(path), 0)
 
     def test_backend_specs_build_commands(self):
         with tempfile.TemporaryDirectory() as tmp:

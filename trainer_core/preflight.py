@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .diffsynth import TORCHAO_MIN_EXCLUSIVE_VERSION, is_version_at_most
+from .diffsynth_support import directory_has_files, path_size_bytes
 
 
 @dataclass
@@ -72,8 +73,8 @@ def run_preflight(
 
     for label, value in model_paths.items():
         path = Path(value)
-        if path.exists():
-            size_gb = path.stat().st_size / (1024 ** 3)
+        if directory_has_files(path):
+            size_gb = path_size_bytes(path) / (1024 ** 3)
             checks.append(_ok(f"model:{label}", f"{label} found ({size_gb:.2f} GB): {path}"))
         else:
             checks.append(_fail(f"model:{label}", f"{label} missing: {path}"))

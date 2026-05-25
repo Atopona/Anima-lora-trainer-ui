@@ -96,6 +96,8 @@ DiffSynth is treated as a first-class backend:
 - The app checks whether `DiffSynth-Studio` exists and whether the current Python can import `diffsynth`.
 - If missing, it clones and installs it automatically.
 - If an installed `diffsynth` points at another checkout, it reinstalls the local one.
+- DiffSynth tokenizer/support files are managed under `DiffSynth-Studio/models/` and checked before training/sampling.
+- Training progress prefers structured events emitted from the patched DiffSynth logger, with tqdm parsing only as a fallback.
 - Old Anima-incompatible LoRA target modules such as `q,k,v,o,ffn.0,ffn.2` are migrated to blank, allowing DiffSynth to auto-detect Anima modules.
 - Metadata is generated as `image,prompt`, and DiffSynth args include `--data_file_keys image`.
 - `torchao<=0.16.0` is upgraded or removed to avoid PEFT dispatch errors.
@@ -141,8 +143,10 @@ logs/samples/
 
 ## Model Management
 
-The Models tab shows Anima DiT, Qwen3 text encoder, and VAE status, size, path,
-and source URL. Use Download Missing Models to fetch missing files from the UI.
+The Models tab shows Anima DiT, Qwen3 text encoder, VAE, plus DiffSynth
+tokenizer/support directories such as `Qwen/Qwen3-0.6B` and SD3.5
+`tokenizer_3`. Use Download Missing Models to clone/install DiffSynth if needed
+and fetch all missing runtime files from the UI.
 
 ## Training History And Outputs
 
@@ -175,8 +179,9 @@ Then open the Gradio share URL. For TensorBoard in Colab, use the TensorBoard
 tab with ngrok, or open the printed local/remote URL if your environment exposes
 ports.
 
-DiffSynth can download tokenizer/model support files through ModelScope on first
-use. The first run may spend time preparing those directories.
+`setup_for_linux.sh` now downloads the default Anima DiT, Qwen3 text encoder,
+VAE, and DiffSynth tokenizer/support files up front. You can also use the Models
+tab later to repair or pre-download those files.
 
 ## Troubleshooting
 
